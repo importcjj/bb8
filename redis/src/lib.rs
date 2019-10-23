@@ -10,34 +10,41 @@ use redis::aio::Connection;
 use redis::{Client, RedisError};
 
 use std::option::Option;
+use tokio::executor::Executor;
 
 type Result<T> = std::result::Result<T, RedisError>;
 
 /// `RedisPool` is a convenience wrapper around `bb8::Pool` that hides the fact that
 /// `RedisConnectionManager` uses an `Option<Connection>` to smooth over the API incompatibility.
 #[derive(Debug)]
-pub struct RedisPool {
-    pool: bb8::Pool<RedisConnectionManager>,
+pub struct RedisPool<T>
+where
+    T: Executor + Send + Sync + 'static + Clone,
+{
+    pool: bb8::Pool<RedisConnectionManager, T>,
 }
 
-impl RedisPool {
+impl<T> RedisPool<T>
+where
+    T: Executor + Send + Sync + 'static + Clone,
+{
     /// Constructs a new `RedisPool`, see the `bb8::Builder` documentation for description of
     /// parameters.
-    pub fn new(pool: bb8::Pool<RedisConnectionManager>) -> RedisPool {
+    pub fn new(pool: bb8::Pool<RedisConnectionManager, T>) -> RedisPool<T> {
         RedisPool { pool }
     }
 
     /// Run the function with a connection provided by the pool.
-    pub fn run<'a, T, E, U, F>(
+    pub fn run<'a, R, E, U, F>(
         &self,
         f: F,
-    ) -> impl Future<Item = T, Error = bb8::RunError<E>> + Send + 'a
+    ) -> impl Future<Item = R, Error = bb8::RunError<E>> + Send + 'a
     where
         F: FnOnce(Connection) -> U + Send + 'a,
-        U: IntoFuture<Item = (Connection, T), Error = E> + 'a,
+        U: IntoFuture<Item = (Connection, R), Error = E> + 'a,
         U::Future: Send,
         E: From<<RedisConnectionManager as bb8::ManageConnection>::Error> + Send + 'a,
-        T: Send + 'a,
+        R: Send + 'a,
     {
         let f = move |conn: Option<Connection>| {
             let conn = conn.unwrap();
