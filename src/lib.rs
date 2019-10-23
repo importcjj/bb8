@@ -26,7 +26,7 @@ use futures::future::{lazy, loop_fn, ok, Either, Loop};
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::sync::oneshot;
-use tokio_executor::spawn;
+use tokio_executor::Executor;
 use tokio_timer::{Interval, Timeout};
 
 mod util;
@@ -292,7 +292,11 @@ impl<M: ManageConnection> Builder<M> {
         self
     }
 
-    fn build_inner(self, manager: M) -> (Pool<M>, impl Future<Item = (), Error = M::Error> + Send) {
+    fn build_inner<T: Executor + Send + Sync + 'static + Clone>(
+        self,
+        manager: M,
+        executor: T,
+    ) -> (Pool<M, T>, impl Future<Item = (), Error = M::Error> + Send) {
         if let Some(min_idle) = self.min_idle {
             assert!(
                 self.max_size >= min_idle,
@@ -300,7 +304,7 @@ impl<M: ManageConnection> Builder<M> {
             );
         }
 
-        let p = Pool::new_inner(self, manager);
+        let p = Pool::new_inner(self, manager, executor);
         let f = p.replenish_idle_connections();
         (p, f)
     }
@@ -309,8 +313,12 @@ impl<M: ManageConnection> Builder<M> {
     ///
     /// The `Pool` will not be returned until it has established its configured
     /// minimum number of connections, or it times out.
-    pub fn build(self, manager: M) -> impl Future<Item = Pool<M>, Error = M::Error> + Send {
-        let (p, f) = self.build_inner(manager);
+    pub fn build<T: Executor + Send + Sync + 'static + Clone>(
+        self,
+        manager: M,
+        executor: T,
+    ) -> impl Future<Item = Pool<M, T>, Error = M::Error> + Send {
+        let (p, f) = self.build_inner(manager, executor);
         f.map(|_| p)
     }
 
@@ -318,8 +326,12 @@ impl<M: ManageConnection> Builder<M> {
     ///
     /// Unlike `build`, this does not wait for any connections to be established
     /// before returning.
-    pub fn build_unchecked(self, manager: M) -> Pool<M> {
-        let (p, f) = self.build_inner(manager);
+    pub fn build_unchecked<T: Executor + Send + Sync + 'static + Clone>(
+        self,
+        manager: M,
+        executor: T,
+    ) -> Pool<M, T> {
+        let (p, f) = self.build_inner(manager, executor);
         p.spawn(p.sink_error(f));
         p
     }
@@ -361,25 +373,30 @@ where
 
 /// The guts of a `Pool`.
 #[allow(missing_debug_implementations)]
-struct SharedPool<M>
+struct SharedPool<M, T>
 where
     M: ManageConnection + Send,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     statics: Builder<M>,
     manager: M,
+    executor: T,
     internals: Mutex<PoolInternals<M::Connection>>,
 }
 
-impl<M> SharedPool<M>
+impl<M, T> SharedPool<M, T>
 where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     fn spawn<R>(&self, runnable: R)
     where
         R: IntoFuture<Item = (), Error = ()>,
         R::Future: Send + 'static,
     {
-        spawn(runnable.into_future());
+        self.executor
+            .clone()
+            .spawn(Box::new(runnable.into_future()));
     }
 
     fn sink_error<'a, E, F>(&self, f: F) -> impl Future<Item = F::Item, Error = ()> + Send + 'a
@@ -411,16 +428,18 @@ where
 }
 
 /// A generic connection pool.
-pub struct Pool<M>
+pub struct Pool<M, T>
 where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
-    inner: Arc<SharedPool<M>>,
+    inner: Arc<SharedPool<M, T>>,
 }
 
-impl<M> Clone for Pool<M>
+impl<M, T> Clone for Pool<M, T>
 where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     fn clone(&self) -> Self {
         Pool {
@@ -429,9 +448,10 @@ where
     }
 }
 
-impl<M> fmt::Debug for Pool<M>
+impl<M, T> fmt::Debug for Pool<M, T>
 where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_fmt(format_args!("Pool({:p})", self.inner))
@@ -440,22 +460,25 @@ where
 
 // Outside of Pool to avoid borrow splitting issues on self
 // NB: This is called with the pool lock held.
-fn add_connection<M>(
-    pool: &Arc<SharedPool<M>>,
+fn add_connection<M, T>(
+    pool: &Arc<SharedPool<M, T>>,
     internals: &mut PoolInternals<M::Connection>,
 ) -> impl Future<Item = (), Error = M::Error> + Send
 where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     assert!(internals.num_conns + internals.pending_conns < pool.statics.max_size);
     internals.pending_conns += 1;
-    fn do_it<M>(pool: &Arc<SharedPool<M>>) -> impl Future<Item = (), Error = M::Error> + Send
+    fn do_it<M, T>(pool: &Arc<SharedPool<M, T>>) -> impl Future<Item = (), Error = M::Error> + Send
     where
         M: ManageConnection,
+        T: Executor + Send + Sync + 'static + Clone,
     {
         let new_shared = Arc::downgrade(pool);
         let (tx, rx) = oneshot::channel();
-        spawn(lazy(move || {
+        let mut executor = pool.executor.clone();
+        executor.spawn(Box::new(lazy(move || {
             match new_shared.upgrade() {
                 None => Either::A(ok(())),
                 Some(shared) => {
@@ -485,7 +508,7 @@ where
                     }))
                 }
             }
-        }));
+        })));
         rx.then(|v| match v {
             Ok(o) => o,
             Err(_) => panic!(),
@@ -495,13 +518,14 @@ where
     do_it(pool)
 }
 
-fn get_idle_connection<M>(
-    inner: Arc<SharedPool<M>>,
-) -> impl Future<Item = Conn<M::Connection>, Error = Arc<SharedPool<M>>> + Send
+fn get_idle_connection<M, T>(
+    inner: Arc<SharedPool<M, T>>,
+) -> impl Future<Item = Conn<M::Connection>, Error = Arc<SharedPool<M, T>>> + Send
 where
     M: ManageConnection + Send,
     M::Connection: Send,
     M::Error: Send,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     loop_fn(inner, |inner| {
         let pool = inner.clone();
@@ -546,14 +570,15 @@ where
 
 // Drop connections
 // NB: This is called with the pool lock held.
-fn drop_connections<'a, L, M>(
-    pool: &Arc<SharedPool<M>>,
+fn drop_connections<'a, L, M, T>(
+    pool: &Arc<SharedPool<M, T>>,
     mut internals: L,
     to_drop: Vec<M::Connection>,
 ) -> Box<dyn Future<Item = (), Error = M::Error> + Send>
 where
     L: BorrowMut<MutexGuard<'a, PoolInternals<M::Connection>>>,
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     let internals = internals.borrow_mut();
 
@@ -579,13 +604,14 @@ where
     Box::new(f)
 }
 
-fn drop_idle_connections<'a, M>(
-    pool: &Arc<SharedPool<M>>,
+fn drop_idle_connections<'a, M, T>(
+    pool: &Arc<SharedPool<M, T>>,
     internals: MutexGuard<'a, PoolInternals<M::Connection>>,
     to_drop: Vec<IdleConn<M::Connection>>,
 ) -> Box<dyn Future<Item = (), Error = M::Error> + Send>
 where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     let to_drop = to_drop.into_iter().map(|c| c.conn.conn).collect();
     drop_connections(pool, internals, to_drop)
@@ -593,12 +619,13 @@ where
 
 // Reap connections if necessary.
 // NB: This is called with the pool lock held.
-fn reap_connections<'a, M>(
-    pool: &Arc<SharedPool<M>>,
+fn reap_connections<'a, M, T>(
+    pool: &Arc<SharedPool<M, T>>,
     mut internals: MutexGuard<'a, PoolInternals<M::Connection>>,
 ) -> impl Future<Item = (), Error = M::Error> + Send
 where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     let now = Instant::now();
     let (to_drop, preserve) = internals.conns.drain(..).partition2(|conn| {
@@ -615,12 +642,13 @@ where
     drop_idle_connections(pool, internals, to_drop)
 }
 
-fn schedule_one_reaping<M>(
-    pool: &SharedPool<M>,
+fn schedule_one_reaping<M, T>(
+    pool: &SharedPool<M, T>,
     interval: Interval,
-    weak_shared: Weak<SharedPool<M>>,
+    weak_shared: Weak<SharedPool<M, T>>,
 ) where
     M: ManageConnection,
+    T: Executor + Send + Sync + 'static + Clone,
 {
     pool.spawn(
         interval
@@ -644,8 +672,11 @@ fn schedule_one_reaping<M>(
     )
 }
 
-impl<M: ManageConnection> Pool<M> {
-    fn new_inner(builder: Builder<M>, manager: M) -> Pool<M> {
+impl<M: ManageConnection, T> Pool<M, T>
+where
+    T: Executor + Send + Sync + 'static + Clone,
+{
+    fn new_inner(builder: Builder<M>, manager: M, executor: T) -> Pool<M, T> {
         let internals = PoolInternals {
             waiters: VecDeque::new(),
             conns: VecDeque::new(),
@@ -653,20 +684,25 @@ impl<M: ManageConnection> Pool<M> {
             pending_conns: 0,
         };
 
-        let shared = Arc::new(SharedPool {
+        let mut shared = Arc::new(SharedPool {
             statics: builder,
             manager: manager,
             internals: Mutex::new(internals),
+            executor: executor,
         });
+
+        let mut executor = shared.executor.clone();
 
         if shared.statics.max_lifetime.is_some() || shared.statics.idle_timeout.is_some() {
             let s = Arc::downgrade(&shared);
-            spawn(lazy(|| {
+            let upgrade = lazy(|| {
                 s.upgrade().ok_or(()).map(|shared| {
                     let interval = Interval::new_interval(shared.statics.reaper_rate);
                     schedule_one_reaping(&shared, interval, s);
                 })
-            }))
+            });
+
+            executor.spawn(Box::new(upgrade));
         }
 
         Pool { inner: shared }
@@ -689,7 +725,7 @@ impl<M: ManageConnection> Pool<M> {
     }
 
     fn replenish_idle_connections_locked(
-        pool: &Arc<SharedPool<M>>,
+        pool: &Arc<SharedPool<M, T>>,
         internals: &mut PoolInternals<M::Connection>,
     ) -> impl Future<Item = (), Error = M::Error> + Send {
         let slots_available = pool.statics.max_size - internals.num_conns - internals.pending_conns;
@@ -745,16 +781,16 @@ impl<M: ManageConnection> Pool<M> {
     ///     future_03_example(client).boxed().compat()
     /// })
     /// ```
-    pub fn run<'a, T, E, U, F>(
+    pub fn run<'a, R, E, U, F>(
         &self,
         f: F,
-    ) -> impl Future<Item = T, Error = RunError<E>> + Send + 'a
+    ) -> impl Future<Item = R, Error = RunError<E>> + Send + 'a
     where
         F: FnOnce(M::Connection) -> U + Send + 'a,
-        U: IntoFuture<Item = (T, M::Connection), Error = (E, M::Connection)> + Send + 'a,
+        U: IntoFuture<Item = (R, M::Connection), Error = (E, M::Connection)> + Send + 'a,
         U::Future: Send + 'a,
         E: From<M::Error> + Send + 'a,
-        T: Send + 'a,
+        R: Send + 'a,
     {
         let inner = self.inner.clone();
         let inner2 = inner.clone();
